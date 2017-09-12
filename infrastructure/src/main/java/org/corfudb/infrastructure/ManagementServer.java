@@ -1,12 +1,19 @@
 package org.corfudb.infrastructure;
 
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import io.netty.channel.ChannelHandlerContext;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -19,14 +26,26 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 import org.corfudb.format.Types.NodeMetrics;
+import org.corfudb.infrastructure.log.StreamLogFiles;
+import org.corfudb.protocols.wireprotocol.AddNodeRequest;
 import org.corfudb.protocols.wireprotocol.CorfuMsg;
 import org.corfudb.protocols.wireprotocol.CorfuMsgType;
 import org.corfudb.protocols.wireprotocol.CorfuPayloadMsg;
 import org.corfudb.protocols.wireprotocol.FailureDetectorMsg;
+import org.corfudb.protocols.wireprotocol.FileSegmentReplicationRequest;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.clients.IClientRouter;
+import org.corfudb.runtime.clients.LayoutClient;
+import org.corfudb.runtime.clients.LogUnitClient;
 import org.corfudb.runtime.clients.ManagementClient;
 import org.corfudb.runtime.clients.SequencerClient;
+import org.corfudb.runtime.exceptions.LayoutModificationException;
+import org.corfudb.runtime.exceptions.OutrankedException;
+import org.corfudb.runtime.exceptions.QuorumUnreachableException;
 import org.corfudb.runtime.view.Layout;
+import org.corfudb.runtime.view.Layout.LayoutSegment;
+import org.corfudb.workflow.Step;
+import org.corfudb.workflow.Workflow;
 
 /**
  * Instantiates and performs failure detection and handling asynchronously.
@@ -101,6 +120,7 @@ public class ManagementServer extends AbstractServer {
 
     /**
      * Returns new ManagementServer.
+     *
      * @param serverContext context object providing parameters and objects
      */
     public ManagementServer(ServerContext serverContext) {
@@ -124,7 +144,7 @@ public class ManagementServer extends AbstractServer {
             Layout singleLayout = new Layout(
                     Collections.singletonList(localAddress),
                     Collections.singletonList(localAddress),
-                    Collections.singletonList(new Layout.LayoutSegment(
+                    Collections.singletonList(new LayoutSegment(
                             Layout.ReplicationMode.CHAIN_REPLICATION,
                             0L,
                             -1L,
@@ -336,6 +356,257 @@ public class ManagementServer extends AbstractServer {
             log.error("Failure Handler could not clone layout: {}", e);
             r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
         }
+    }
+
+    @ServerHandler(type = CorfuMsgType.ADD_NODE_REQUEST, opTimer = metricsPrefix + "add-node")
+    public void handleAddNodeRequest(CorfuPayloadMsg<AddNodeRequest> msg,
+                                     ChannelHandlerContext ctx, IServerRouter r,
+                                     boolean isMetricsEnabled) {
+        if (isShutdown()) {
+            log.warn("Management Server received {} but is shutdown.", msg.getMsgType().toString());
+            r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
+            return;
+        }
+        // This server has not been bootstrapped yet, ignore all requests.
+        if (!checkBootstrap(msg, ctx, r)) {
+            return;
+        }
+
+        log.info("Received add node request: {}", msg.getPayload());
+
+        Workflow workflow = new Workflow.WorkflowBuilder()
+                .addStep(new Step("addNode", () -> {
+                    // Bootstrap the to-be added node with the old layout.
+                    IClientRouter newEndpointRouter = getCorfuRuntime().getRouter(msg.getPayload()
+                            .getEndpoint());
+                    try {
+                        // Ignoring call result as the call returns ACK or throws an exception.
+                        newEndpointRouter.getClient(LayoutClient.class)
+                                .bootstrapLayout(latestLayout).get();
+                        newEndpointRouter.getClient(ManagementClient.class)
+                                .bootstrapManagement(latestLayout).get();
+                        newEndpointRouter.getClient(ManagementClient.class)
+                                .initiateFailureHandler().get();
+
+                        log.info("handleAddNodeRequest: New node {} bootstrapped.",
+                                msg.getPayload().getEndpoint());
+                    } catch (Exception e) {
+                        log.error("handleAddNodeRequest: "
+                                + "Aborting as new node could not be bootstrapped : ", e);
+                        r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
+                        return false;
+                    }
+
+                    try {
+                        failureHandlerDispatcher.addNode((Layout) latestLayout.clone(),
+                                getCorfuRuntime(), msg.getPayload());
+                        safeUpdateLayout(getCorfuRuntime().getLayoutView().getLayout());
+                        r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.ACK));
+                    } catch (Exception e) {
+                        log.error("Request to add new node: {} failed with exception:",
+                                msg.getPayload(), e);
+                        r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
+                    }
+                    return true;
+                }))
+                .build();
+        try {
+            workflow.executeAsync().get();
+        } catch (InterruptedException | ExecutionException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @ServerHandler(type = CorfuMsgType.MERGE_SEGMENTS_REQUEST, opTimer = metricsPrefix
+            + "merge-segments")
+    public void handleMergeSegmentRequest(CorfuMsg msg,
+                                          ChannelHandlerContext ctx,
+                                          IServerRouter r, boolean isMetricsEnabled) {
+        if (isShutdown()) {
+            log.warn("Management Server received {} but is shutdown.", msg.getMsgType().toString());
+            r.sendResponse(ctx, msg, CorfuMsgType.NACK.msg());
+            return;
+        }
+        // This server has not been bootstrapped yet, ignore all requests.
+        if (!checkBootstrap(msg, ctx, r)) {
+            return;
+        }
+
+        log.info("Received merge segments request.");
+
+        if (segmentCopyWorkflow != null) {
+            // Workflow already started. Check status and send appropriate message to caller.
+            if (segmentCopyWorkflow.isDone() && !segmentCopyWorkflow.isCompletedExceptionally()) {
+                // Completed successfully.
+            } else if (!segmentCopyWorkflow.isDone()) {
+                // Workflow in progress.
+                return;
+            } else {
+                // Workflow ended exceptionally. Return exception to user.
+                return;
+            }
+        } else {
+            log.info("Submitting task to replicate and merge segments");
+
+            List<LayoutSegment> segmentList = latestLayout.getSegments();
+            if (segmentList.size() < 2) {
+                log.info("Not enough segments to merge.");
+                return;
+            }
+
+            int collapsingSegmentIndex = segmentList.size() - 1;
+            LayoutSegment collapsingSegment = segmentList.get(collapsingSegmentIndex);
+            int oldSegmentIndex = segmentList.size() - 2;
+            LayoutSegment oldSegment = segmentList.get(oldSegmentIndex);
+
+            Set<String> newNodes = new HashSet<>();
+            collapsingSegment.getStripes().forEach(
+                    layoutStripe -> newNodes.addAll(layoutStripe.getLogServers()));
+            oldSegment.getStripes().forEach(
+                    layoutStripe -> newNodes.removeAll(layoutStripe.getLogServers()));
+
+            final String[] recoveringNode = newNodes.toArray(new String[newNodes.size()]);
+            // FIXME: All new nodes
+            if (newNodes.size() != 1) {
+                log.warn("Cannot merge segments with multiple new nodes: {}", newNodes);
+                return;
+            }
+
+            newNodes.forEach(s -> recoveringNode[0] = s);
+
+            // Segment catchup by selective hole filling.
+            segmentCopyWorkflow = CompletableFuture.supplyAsync(
+                    () -> segmentCatchup(oldSegment));
+
+            // Segment Replication.
+            segmentCopyWorkflow = segmentCopyWorkflow.thenApplyAsync(segmentCatchupResult -> {
+                if (!segmentCatchupResult) {
+                    // Cannot start replication if segment catchup fails.
+                    log.error("segment catchup has failed. Cannot replicate segment.");
+                    return segmentCatchupResult;
+                }
+                log.info("Starting segment replication.");
+
+                return replicateSegment(oldSegment,
+                        getCorfuRuntime().getRouter(recoveringNode[0])
+                                .getClient(LogUnitClient.class));
+            });
+
+            // Trigger segment merge.
+            segmentCopyWorkflow = segmentCopyWorkflow.thenApplyAsync(segmentReplicationResult -> {
+                if (!segmentReplicationResult) {
+                    // Cannot merge if segment replication fails.
+                    return segmentReplicationResult;
+                }
+                try {
+                    failureHandlerDispatcher
+                            .mergeSegments((Layout) latestLayout.clone(), getCorfuRuntime());
+                    safeUpdateLayout(getCorfuRuntime().getLayoutView().getLayout());
+                    r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.ACK));
+                } catch (Exception e) {
+                    log.error("Request to merge segments failed with exception:", e);
+                    return false;
+                }
+                return true;
+            });
+
+            segmentCopyWorkflow.exceptionally(throwable -> {
+                log.error("Add node failed due to exception: ", throwable);
+                return false;
+            });
+        }
+        r.sendResponse(ctx, msg, CorfuMsgType.ACK.msg());
+    }
+
+    private CompletableFuture<Boolean> segmentCopyWorkflow;
+
+    public boolean segmentCatchup(LayoutSegment segment) {
+        log.info("Starting hole filling.");
+
+        // TODO: Abstract this logic to replication mode specific segment merging.
+        // Enabling merge segments only for chain replication.
+        if (!segment.getReplicationMode().equals(Layout.ReplicationMode.CHAIN_REPLICATION)) {
+            throw new UnsupportedOperationException(
+                    "Segment catchup only implemented for chain replication.");
+        }
+
+        // Catchup segment for every stripe.
+        for (Layout.LayoutStripe layoutStripe : segment.getStripes()) {
+            List<String> logServers = layoutStripe.getLogServers();
+
+            if (logServers.size() < 2) {
+                log.info("Hole filling not required as only one log server present in stripe.");
+                continue;
+            }
+
+            // Chain replication specific hole filling mechanism.
+            Set<Long> headKnownAddressSet;
+            Set<Long> tailKnownAddressSet;
+
+            try {
+                // Fetch known address set from head.
+                headKnownAddressSet = getCorfuRuntime()
+                        .getRouter(logServers.get(0))
+                        .getClient(LogUnitClient.class)
+                        .requestKnownAddressSet(segment.getStart(), segment.getEnd()).get();
+                // Fetch known address set from tail.
+                tailKnownAddressSet = getCorfuRuntime()
+                        .getRouter(logServers.get(logServers.size() - 1))
+                        .getClient(LogUnitClient.class)
+                        .requestKnownAddressSet(segment.getStart(), segment.getEnd()).get();
+
+            } catch (InterruptedException | ExecutionException e) {
+                log.error("Unable to fetch known address set from log units, ", e);
+                return false;
+            }
+
+            // Diff known address sets.
+            Set<Long> differenceSet = Sets.difference(headKnownAddressSet, tailKnownAddressSet)
+                    .immutableCopy();
+
+            if (differenceSet.isEmpty()) {
+                log.info("Head and tail log servers in the chain have given segment replicated.");
+                continue;
+            }
+
+            // Trigger reads on tail for result addresses to hole fill differences.
+            getCorfuRuntime().getAddressSpaceView().read(differenceSet);
+        }
+        log.info("Segment catchup completed.");
+
+        return true;
+    }
+
+    public boolean replicateSegment(LayoutSegment layoutSegment, LogUnitClient logUnitClient) {
+        try {
+            long logFileStartSegment =
+                    layoutSegment.getStart() / StreamLogFiles.RECORDS_PER_LOG_FILE;
+            long logFileEndSegment =
+                    layoutSegment.getEnd() / StreamLogFiles.RECORDS_PER_LOG_FILE;
+
+            log.info("Replicating files from:{} to:{}", logFileStartSegment, logFileEndSegment);
+            for (long i = logFileStartSegment; i <= logFileEndSegment; i++) {
+                // Stream files directly as they are in the committed set.
+                String filePath = serverContext.getServerConfig().get("--log-path")
+                        + File.separator + "log" + File.separator + i + ".log";
+
+                log.info("Replicating file: {}", filePath);
+
+                File segmentFile = new File(filePath);
+                FileInputStream fis = new FileInputStream(segmentFile);
+                byte[] fileBuffer = new byte[(int) segmentFile.length()];
+                fis.read(fileBuffer);
+                // We pay the cost of byte[] copy.
+                logUnitClient.replicateSegment(
+                        new FileSegmentReplicationRequest(i, fileBuffer, true)).get();
+            }
+
+        } catch (InterruptedException | ExecutionException | IOException e) {
+            e.printStackTrace();
+            log.error("ChainReplication: Segment replication failed, ", e);
+            return false;
+        }
+        return true;
     }
 
     /**

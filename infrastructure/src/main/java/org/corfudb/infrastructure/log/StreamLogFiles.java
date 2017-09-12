@@ -734,6 +734,34 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
 
     }
 
+    SegmentHandle createSegmentHandle(String filePath, long segmentIndex) {
+        try {
+            boolean verify = true;
+            if (noVerify) {
+                verify = false;
+            }
+
+            FileChannel fc1 = getChannel(filePath, false);
+            FileChannel fc2 = getChannel(getTrimmedFilePath(filePath), false);
+            FileChannel fc3 = getChannel(getPendingTrimsFilePath(filePath), false);
+
+            if (fc1.size() == 0) {
+                writeHeader(fc1, VERSION, verify);
+                log.trace("Opened new segment file, writing header for {}", filePath);
+            }
+            log.trace("Opened new log file at {}", filePath);
+            SegmentHandle sh = new SegmentHandle(segmentIndex, fc1, fc2, fc3, filePath);
+            // The first time we open a file we should read to the end, to load the
+            // map of entries we already have.
+            readAddressSpace(sh);
+            loadTrimAddresses(sh);
+            return sh;
+        } catch (IOException e) {
+            log.error("Error opening file {}", filePath, e);
+            throw new RuntimeException(e);
+        }
+    }
+
     /**
      * Gets the file channel for a particular address, creating it
      * if is not present in the map.
@@ -748,33 +776,8 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         filePath += segment;
         filePath += ".log";
 
-        SegmentHandle handle = writeChannels.computeIfAbsent(filePath, a -> {
-            try {
-                boolean verify = true;
-                if (noVerify) {
-                    verify = false;
-                }
-
-                FileChannel fc1 = getChannel(a, false);
-                FileChannel fc2 = getChannel(getTrimmedFilePath(a), false);
-                FileChannel fc3 = getChannel(getPendingTrimsFilePath(a), false);
-
-                if (fc1.size() == 0) {
-                    writeHeader(fc1, VERSION, verify);
-                    log.trace("Opened new segment file, writing header for {}", a);
-                }
-                log.trace("Opened new log file at {}", a);
-                SegmentHandle sh = new SegmentHandle(segment, fc1, fc2, fc3, a);
-                // The first time we open a file we should read to the end, to load the
-                // map of entries we already have.
-                readAddressSpace(sh);
-                loadTrimAddresses(sh);
-                return sh;
-            } catch (IOException e) {
-                log.error("Error opening file {}", a, e);
-                throw new RuntimeException(e);
-            }
-        });
+        SegmentHandle handle = writeChannels.computeIfAbsent(filePath,
+                a -> createSegmentHandle(a, segment));
 
         handle.retain();
         return handle;
@@ -980,6 +983,32 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         }
     }
 
+    public void replicateSegment(String sourceFilePath,
+                                 String destinationFilePath,
+                                 long segmentIndex) throws IOException {
+
+        // Generate a segment handler for this source data file.
+        // Load all addresses into the segment handle from the file.
+        SegmentHandle sourceSegmentHandle = createSegmentHandle(sourceFilePath, segmentIndex);
+
+        // Append all addresses to the existing file and abort if overwrite exception encountered.
+        for (Long knownAddress : sourceSegmentHandle.knownAddresses.keySet()) {
+            try {
+                append(knownAddress, readRecord(sourceSegmentHandle, knownAddress));
+            } catch (OverwriteException ignore) {
+                // Ignore overwrite exceptions in replication.
+            }
+        }
+
+        // Reset handler for existing file.
+        resetSegmentHandler(destinationFilePath);
+
+        // Remove source SegmentHandle and also remove file since all was successful.
+        sourceSegmentHandle.close();
+
+        log.info("File Segment {}.log replication completed.", segmentIndex);
+    }
+
     @Override
     public LogData read(long address) {
         if (isTrimmed(address)) {
@@ -996,6 +1025,13 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
             throw new RuntimeException(e);
         } finally {
             sh.release();
+        }
+    }
+
+    public synchronized void resetSegmentHandler(String filePath) {
+        SegmentHandle sh = writeChannels.remove(filePath);
+        if (sh != null) {
+            sh.close();
         }
     }
 
@@ -1040,6 +1076,20 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         }
     }
 
+    public Set<Long> getKnownAddressesInRange(long startAddress, long endAddress) {
+
+        long startSegment = startAddress / RECORDS_PER_LOG_FILE;
+        long endSegment = endAddress / RECORDS_PER_LOG_FILE;
+
+        Set<Long> knownAddressSet = new HashSet<>();
+        for (long segmentIndex = startSegment; segmentIndex <= endSegment; segmentIndex++) {
+            String filePath = logDir + File.separator + segmentIndex + ".log";
+            knownAddressSet.addAll(writeChannels.get(filePath).knownAddresses.keySet());
+        }
+
+        return knownAddressSet;
+    }
+
     /**
      * A SegmentHandle is a range view of consecutive addresses in the log. It contains
      * the address space along with metadata like addresses that are trimmed and pending trims.
@@ -1080,6 +1130,7 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
             for (FileChannel channel : channels) {
                 try {
                     channel.force(true);
+                    channelsToSync.remove(channel);
                     channel.close();
                     channel = null;
                 } catch (Exception e) {

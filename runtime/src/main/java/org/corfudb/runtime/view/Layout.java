@@ -433,6 +433,7 @@ public class Layout implements Cloneable {
                             r.getParameters().getHoleFillRetry()));
                 }
             }
+
         },
         QUORUM_REPLICATION {
             @Override
@@ -489,6 +490,7 @@ public class Layout implements Cloneable {
         public IReplicationProtocol getReplicationProtocol(CorfuRuntime r) {
             throw new UnsupportedOperationException();
         }
+
     }
 
 

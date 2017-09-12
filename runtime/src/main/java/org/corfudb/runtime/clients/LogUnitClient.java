@@ -19,19 +19,7 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
 import org.corfudb.protocols.logprotocol.LogEntry;
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
-import org.corfudb.protocols.wireprotocol.CorfuMsgType;
-import org.corfudb.protocols.wireprotocol.CorfuPayloadMsg;
-import org.corfudb.protocols.wireprotocol.DataType;
-import org.corfudb.protocols.wireprotocol.FillHoleRequest;
-import org.corfudb.protocols.wireprotocol.ILogData;
-import org.corfudb.protocols.wireprotocol.IMetadata;
-import org.corfudb.protocols.wireprotocol.MultipleReadRequest;
-import org.corfudb.protocols.wireprotocol.ReadRequest;
-import org.corfudb.protocols.wireprotocol.ReadResponse;
-import org.corfudb.protocols.wireprotocol.TrimRequest;
-import org.corfudb.protocols.wireprotocol.WriteMode;
-import org.corfudb.protocols.wireprotocol.WriteRequest;
+import org.corfudb.protocols.wireprotocol.*;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.DataCorruptionException;
 import org.corfudb.runtime.exceptions.DataOutrankedException;
@@ -238,6 +226,14 @@ public class LogUnitClient implements IClient {
     private static Object handleTrimMarkResponse(CorfuPayloadMsg<Long> msg,
                                              ChannelHandlerContext ctx, IClientRouter r) {
         return msg.getPayload();
+    }
+
+    @ClientHandler(type = CorfuMsgType.KNOWN_ADDRESS_RESPONSE)
+    private static Object handleKnownAddressSetResponse(CorfuPayloadMsg<KnownAddressSetResponse>
+                                                                msg,
+                                                        ChannelHandlerContext ctx,
+                                                        IClientRouter r) {
+        return msg.getPayload().getKnownAddresses();
     }
 
     /**
@@ -448,5 +444,15 @@ public class LogUnitClient implements IClient {
                 CorfuRuntime.getMpLUC()
                         + getHost() + ":" + getPort().toString() + "-" + opName);
         return t.time();
+    }
+
+    public CompletableFuture<Boolean> replicateSegment(FileSegmentReplicationRequest msg) {
+        return router.sendMessageAndGetCompletable(
+                CorfuMsgType.SEGMENT_REPLICATION.payloadMsg(msg));
+    }
+
+    public CompletableFuture<Set<Long>> requestKnownAddressSet(long startAddress, long endAddress) {
+        return router.sendMessageAndGetCompletable(CorfuMsgType.KNOWN_ADDRESS_REQUEST.payloadMsg(
+                new KnownAddressSetRequest(startAddress, endAddress)));
     }
 }

@@ -25,8 +25,8 @@ public class Bench {
         String corfuConfigurationString = "localhost:9000";
 	int size = 10 * 1000;
 	if (args.length >= 1) {
-		System.out.println("Connecting to " + args[0]);
 		corfuConfigurationString = args[0];
+		System.out.println("Connecting to " + corfuConfigurationString);
 	}
 	if (args.length >= 2) {
 		size = Integer.parseInt(args[1]);

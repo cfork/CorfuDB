@@ -29,7 +29,7 @@ public class Bench {
 		corfuConfigurationString = args[0];
 	}
 	if (args.length >= 2) {
-		size = Integer.parseInt(args[1]) * 1000;
+		size = Integer.parseInt(args[1]);
 		System.out.println("Size of test " + size);
 	}
 

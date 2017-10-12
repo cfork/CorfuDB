@@ -47,6 +47,9 @@ public class Bench {
 		sv.append(testPayload);
 	}
 	long et = System.nanoTime() - startTime;
+	for (int i = 0; i < size/10; i++) {
+		sv.append(testPayload);
+	}
 	System.out.printf("time: %f ms, latency: %f ms/op, throughput: %f op/s\n", et/1e6, et/1e6/size, size*1e9/et);
     }
 }

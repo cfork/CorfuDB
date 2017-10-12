@@ -38,7 +38,6 @@ public class Bench {
 		payload += s;
 	}
 	byte[] testPayload = payload.getBytes(); // 4K size
-	System.out.println(testPayload.length);
         IStreamView sv = runtime.getStreamsView().get(streamA);
 	for (int i = 0; i < size/10; i++) {
 		sv.append(testPayload);

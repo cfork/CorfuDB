@@ -26,31 +26,28 @@ public class Bench {
 	int size = 10 * 1000;
 	if (args.length >= 1) {
 		corfuConfigurationString = args[0];
-		System.out.println("Connecting to " + corfuConfigurationString);
 	}
 	if (args.length >= 2) {
 		size = Integer.parseInt(args[1]);
-		System.out.println("Size of test " + size);
 	}
-
-        /**
-         * First, the application needs to instantiate a CorfuRuntime,
-         * which is a Java object that contains all of the Corfu utilities exposed to applications.
-         */
         CorfuRuntime runtime = getRuntimeAndConnect(corfuConfigurationString);
-
-        /**
-         * Obviously, this application is not doing much yet,
-         * but you can already invoke getRuntimeAndConnect to test if you can connect to a deployed Corfu service.
-         *
-         * Above, you will need to point it to a host and port which is running the service.
-         * See {@link https://github.com/CorfuDB/CorfuDB} for instructions on how to deploy Corfu.
-         */
         UUID streamA = UUID.nameUUIDFromBytes("stream A".getBytes());
-        byte[] testPayload = "hello world".getBytes();
+	String s = "helloworld";
+	String payload = "";
+	for (int i = 0; i < 400; i++) {
+		payload += s;
+	}
+	byte[] testPayload = payload.getBytes(); // 4K size
+	System.out.println(testPayload.length);
         IStreamView sv = runtime.getStreamsView().get(streamA);
+	for (int i = 0; i < size/10; i++) {
+		sv.append(testPayload);
+	}
+	long startTime = System.nanoTime();
 	for (int i = 0; i < size; i++) {
 		sv.append(testPayload);
 	}
+	long et = System.nanoTime() - startTime;
+	System.out.printf("time: %f ms, latency: %f ms/op, throughput: %f op/s\n", et/1e6, et/1e6/size, size*1e9/et);
     }
 }

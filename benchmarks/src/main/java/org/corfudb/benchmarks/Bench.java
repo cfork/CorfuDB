@@ -5,15 +5,14 @@ import org.corfudb.runtime.view.stream.IStreamView;
 import org.corfudb.util.GitRepositoryState;
 
 import java.util.UUID;
-import java.util.concurrent.Semaphore;
 
 public class Bench {
 
-	private static Semaphore mutex = new Semaphore(1);
         private static String config = "localhost:9000";
 	private static int size = 10 * 1000;
 	private static int count = size;
 	private static int nthread = 1;
+	private static Object lock = new Object();
 
 	private static class Client implements Runnable {
 		private IStreamView sv = null;
@@ -32,20 +31,15 @@ public class Bench {
 		}
 
 		public void run() {
-			try {
-				while (true) {
-					mutex.acquire();
+			while (true) {
+				synchronized (lock) {
 					if (count > 0) {
 						count --;
-						mutex.release();
-						sv.append(testPayload);
 					} else {
-						mutex.release();
 						return;
 					}
 				}
-			} catch (Exception e) {
-				e.printStackTrace();
+				sv.append(testPayload);
 			}
 
 		}

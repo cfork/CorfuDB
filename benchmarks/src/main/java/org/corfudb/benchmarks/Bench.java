@@ -5,15 +5,53 @@ import org.corfudb.runtime.view.stream.IStreamView;
 import org.corfudb.util.GitRepositoryState;
 
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 
 public class Bench {
-    /**
-     * Internally, the corfuRuntime interacts with the CorfuDB service over TCP/IP sockets.
-     *
-     * @param configurationString specifies the IP:port of the CorfuService
-     *                            The configuration string has format "hostname:port", for example, "localhost:9090".
-     * @return a CorfuRuntime object, with which Corfu applications perform all Corfu operations
-     */
+
+	private static Semaphore mutex = new Semaphore(1);
+        private static String config = "localhost:9000";
+	private static int size = 10 * 1000;
+	private static int count = size;
+	private static int nthread = 1;
+
+	private static class Client implements Runnable {
+		private IStreamView sv = null;
+		private byte[] testPayload;
+
+		public Client(String config) {
+			CorfuRuntime runtime = getRuntimeAndConnect(config);
+			UUID streamA = UUID.nameUUIDFromBytes("stream A".getBytes());
+			String s = "helloworld";
+			String payload = "";
+			for (int i = 0; i < 400; i++) {
+				payload += s;
+			}
+			testPayload = payload.getBytes(); // 4K size
+			sv = runtime.getStreamsView().get(streamA);
+		}
+
+		public void run() {
+			try {
+				while (true) {
+					mutex.acquire();
+					if (count > 0) {
+						count --;
+						mutex.release();
+						sv.append(testPayload);
+					} else {
+						mutex.release();
+						return;
+					}
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+
+		}
+
+	}
+
     private static CorfuRuntime getRuntimeAndConnect(String configurationString) {
 
         CorfuRuntime corfuRuntime = new CorfuRuntime(configurationString).connect();
@@ -21,35 +59,34 @@ public class Bench {
     }
 
     public static void main(String[] args) {
-
-        String corfuConfigurationString = "localhost:9000";
-	int size = 10 * 1000;
 	if (args.length >= 1) {
-		corfuConfigurationString = args[0];
+		config = args[0];
 	}
 	if (args.length >= 2) {
 		size = Integer.parseInt(args[1]);
+		count = size;
 	}
-        CorfuRuntime runtime = getRuntimeAndConnect(corfuConfigurationString);
-        UUID streamA = UUID.nameUUIDFromBytes("stream A".getBytes());
-	String s = "helloworld";
-	String payload = "";
-	for (int i = 0; i < 400; i++) {
-		payload += s;
+	if (args.length >= 3) {
+		nthread = Integer.parseInt(args[2]);
 	}
-	byte[] testPayload = payload.getBytes(); // 4K size
-        IStreamView sv = runtime.getStreamsView().get(streamA);
-	for (int i = 0; i < size/10; i++) {
-		sv.append(testPayload);
+	Thread[] clients = new Thread[nthread];
+	for (int i = 0; i < nthread; i++) {
+		clients[i] = new Thread(new Client(config));
 	}
+
 	long startTime = System.nanoTime();
-	for (int i = 0; i < size; i++) {
-		sv.append(testPayload);
+	for (int i = 0; i < nthread; i++) {
+		clients[i].start();
+	}
+	for (int i = 0; i < nthread; i++) {
+		try {
+			clients[i].join();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 	long et = System.nanoTime() - startTime;
-	for (int i = 0; i < size/10; i++) {
-		sv.append(testPayload);
-	}
-	System.out.printf("time: %f ms, latency: %f ms/op, throughput: %f op/s\n", et/1e6, et/1e6/size, size*1e9/et);
+
+	System.out.printf("nthread: %d, time: %f ms, latency: %f ms/op, throughput: %f op/s\n", nthread, et/1e6, et/1e6/size, size*1e9/et);
     }
 }

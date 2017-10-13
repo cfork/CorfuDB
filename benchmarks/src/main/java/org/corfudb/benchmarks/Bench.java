@@ -87,6 +87,6 @@ public class Bench {
 	}
 	long et = System.nanoTime() - startTime;
 
-	System.out.printf("nthread: %d, time: %f ms, latency: %f ms/op, throughput: %f op/s\n", nthread, et/1e6, et/1e6/size, size*1e9/et);
+	System.out.printf("nthread: %d, time: %f ms, latency: %f ms/op, throughput: %f op/s\n", nthread, et/1e6, et/1e6/size*nthread, size*1e9/et);
     }
 }
